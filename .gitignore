@@ -1,0 +1,21 @@
+# Compiled objects and dependencies
+*.o
+*.d
+minieap
+ifaddrs/
+
+# Editor / OS noise (keep the CI workflow directory!)
+.*
+!.github/
+!.gitattributes
+!.gitignore
+
+# Build output
+build/
+build-*/
+dist/
+Makefile.gui
+.qmake.stash
+*.exe
+*.dll
+*.zip

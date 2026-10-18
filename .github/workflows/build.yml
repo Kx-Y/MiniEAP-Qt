@@ -1,0 +1,165 @@
+name: Build
+
+on:
+  push:
+    branches: [ master, main ]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Linux and macOS.
+  #
+  # These jobs verify that the POSIX paths still build: sockraw / BPF capture,
+  # iconv, SIGALRM and flock. They use the distribution Qt packages.
+  # ---------------------------------------------------------------------------
+  posix:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ ubuntu-latest, macos-latest ]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake ninja-build \
+            qt6-base-dev libpcap-dev
+
+      - name: Install dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: brew install cmake ninja qt
+
+      - name: Configure
+        run: |
+          PREFIX=""
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            PREFIX="-DCMAKE_PREFIX_PATH=$(brew --prefix qt)"
+          fi
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release $PREFIX
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Smoke test the console client
+        run: |
+          ./build/bin/minieap --help > /dev/null
+          echo "console client starts and parses arguments"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: minieap-${{ matrix.os }}
+          path: build/bin
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # Windows: Qt's official llvm-mingw build.
+  #
+  # Qt 6 for Windows is linked against libc++, so the C++ front end must be
+  # compiled with the matching toolchain. That toolchain ships as a separate
+  # Qt "Tools" archive whose name changes between releases
+  # ("llvm-mingw1706_64", "llvm-mingw_64", ...), and aqt does not expose a
+  # stable tool id for it - that is what made the earlier run fail with
+  # "Failed to locate XML data for the tool 'tools_llvm-mingw1706'".
+  #
+  # Instead of relying on aqt for the toolchain, this job discovers the
+  # toolchain inside the Qt installation (it is placed under Qt/Tools) and
+  # falls back to the LLVM-MinGW release archive if it is missing.
+  # ---------------------------------------------------------------------------
+  windows:
+    name: windows-llvm-mingw
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Qt (llvm-mingw kit)
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: '6.8.0'
+          host: windows
+          target: desktop
+          arch: win64_llvm_mingw
+          cache: true
+          # No `tools:` here on purpose; see the comment above.
+
+      - name: Locate the llvm-mingw toolchain
+        id: toolchain
+        shell: pwsh
+        run: |
+          $QtDir = $env:QT_ROOT_DIR
+          if (-not $QtDir) { $QtDir = $env:QTDIR }
+          if (-not $QtDir) { throw "Qt root directory was not exported" }
+          Write-Host "Qt dir: $QtDir"
+
+          # aqt puts tools under <parent of Qt>/Tools
+          $toolsRoot = Join-Path (Split-Path $QtDir -Parent) "..\Tools"
+          $toolsRoot = [System.IO.Path]::GetFullPath($toolsRoot)
+          Write-Host "Tools root: $toolsRoot"
+
+          $candidates = @()
+          if (Test-Path $toolsRoot) {
+            $candidates = Get-ChildItem $toolsRoot -Directory -Filter "llvm-mingw*" |
+                          Sort-Object Name -Descending
+          }
+
+          $mingw = $null
+          foreach ($c in $candidates) {
+            $clang = Join-Path $c.FullName "bin\x86_64-w64-mingw32-clang.exe"
+            if (Test-Path $clang) { $mingw = $c.FullName; break }
+          }
+
+          # Fallback: the kit may bundle its own compiler next to Qt
+          if (-not $mingw) {
+            $clang = Join-Path $QtDir "bin\x86_64-w64-mingw32-clang.exe"
+            if (Test-Path $clang) { $mingw = $QtDir }
+          }
+
+          if (-not $mingw) {
+            Write-Host "Qt did not ship the llvm-mingw toolchain; downloading it"
+            $url = "https://github.com/mstorsjo/llvm-mingw/releases/download/20240619/llvm-mingw-20240619-ucrt-x86_64.zip"
+            $zip = "$env:TEMP\llvm-mingw.zip"
+            Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing
+            Expand-Archive -Path $zip -DestinationPath "$env:RUNNER_TOOL_CACHE\llvm-mingw" -Force
+            $mingw = (Get-ChildItem "$env:RUNNER_TOOL_CACHE\llvm-mingw" -Directory | Select-Object -First 1).FullName
+          }
+
+          Write-Host "llvm-mingw: $mingw"
+          "path=$mingw" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+      - name: Build (console + GUI)
+        shell: pwsh
+        run: |
+          $QtDir = $env:QT_ROOT_DIR
+          if (-not $QtDir) { $QtDir = $env:QTDIR }
+          $MingwDir = "${{ steps.toolchain.outputs.path }}"
+          powershell -ExecutionPolicy Bypass -File scripts/build-windows.ps1 `
+            -QtDir $QtDir -MingwDir $MingwDir -BuildDir build
+
+      - name: Smoke test the console client
+        shell: pwsh
+        run: |
+          .\build\minieap.exe --help | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "console client failed" }
+
+      - name: Render the GUI (headless check)
+        shell: pwsh
+        run: |
+          # --screenshot renders the window and exits; it fails loudly if a
+          # Qt platform plugin or DLL is missing.
+          .\build\minieap-qt.exe --screenshot shot.png
+          if (-not (Test-Path shot.png)) { throw "GUI did not start" }
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: minieap-windows
+          path: build
+          if-no-files-found: warn
